@@ -1,0 +1,78 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the library and the rmsnorm_fp32 ctest test and runs it on a simulated
+# NVIDIA H100 (https://github.com/pantheongpu/pantheonsim). A simulator cannot
+# reproduce hardware-specific behavior or timing, so it complements real-GPU
+# testing and does not replace it.
+#
+# A wrong-architecture run can print a VirtualGPU error and still exit 0, so
+# the job also checks the output for that, for a missing device, and for the
+# simulator's kernel launch counters.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "csrc/**"
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: RMSNorm test (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # 90-virtual embeds PTX only, which the simulator runs (the default
+      # architecture is SM 120 SASS). The simulator needs a shared CUDA runtime.
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+            -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+
+      - name: Build
+        run: cmake --build build -j3
+
+      - name: Run the test
+        working-directory: build
+        run: |
+          vgpu run --counters ctest --output-on-failure -V > ../ctest.log 2>&1 || { tail -n 100 ../ctest.log; exit 1; }
+          grep -E "\[RMSNorm\]|Passed:|tests passed" ../ctest.log
+          grep -v "\[vgpu\]\[counters\]" ../ctest.log > ../ctest-nocounters.log
+          if grep -niE "VirtualGPU error|no device|no CUDA-capable|CUDA ERROR|skipp|not run|\*\*\*Failed|\*\*\*Exception" ../ctest-nocounters.log ||
+             grep -nE "FAILED|Failed case" ../ctest-nocounters.log; then
+            echo "::error::the run reported a device problem, a skipped test or a failure"; exit 1
+          fi
+          grep -q "100% tests passed, 0 tests failed out of 1" ../ctest.log
+          grep -qE "Passed: 14 / 14$" ../ctest.log
+          grep -qE "\[RMSNorm\] Invalid arguments PASSED$" ../ctest.log
+          launches=$(grep -c "\[vgpu\]\[counters\]" ../ctest.log)
+          grep "\[vgpu\]\[counters\]" ../ctest.log | head -n 3
+          echo "kernel launch counter lines recorded by the simulator: $launches"
+          test "$launches" -ge 14
